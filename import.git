@@ -1,0 +1,174 @@
+﻿import os
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import mimetypes
+from concurrent.futures import ThreadPoolExecutor
+import argparse
+
+
+def get_media_links(url, session):
+    try:
+        response = session.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        media_links = []
+
+
+        # Поиск всех возможных медиа-тегов
+        for tag in soup.find_all(['img', 'video', 'source', 'a']):
+            if tag.name == 'img':
+                src = tag.get('src') or tag.get('data-src')
+            elif tag.name == 'video':
+                src = tag.get('src') or (tag.find('source') and tag.find('source').get('src'))
+            elif tag.name == 'source':
+                src = tag.get('src')
+            elif tag.name == 'a':
+                href = tag.get('href')
+                if href and any(href.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.webm']):
+                    src = href
+                else:
+                    continue
+            else:
+                continue
+
+
+            if src and not src.startswith(('data:', 'javascript:')):
+                full_url = urljoin(url, src)
+                media_links.append(full_url)
+
+
+        return list(set(media_links))  # Убираем дубликаты
+    except Exception as e:
+        print(f"Ошибка при парсинге {url}: {e}")
+        return []
+
+
+def get_file_info(url, session):
+    try:
+        head = session.head(url, timeout=5, allow_redirects=True)
+        if head.status_code != 200:
+            return None
+
+
+        content_type = head.headers.get('Content-Type', '')
+        file_size = int(head.headers.get('Content-Length', 0))
+
+
+        # Определяем расширение файла
+        ext = mimetypes.guess_extension(content_type.split(';')[0].strip())
+        if not ext:
+            ext = os.path.splitext(urlparse(url).path)[1]
+            if not ext:
+                return None
+
+
+        return {
+            'url': url,
+            'type': content_type.split('/')[0],  # 'image' или 'video'
+            'extension': ext.lower(),
+            'size': file_size
+        }
+    except Exception as e:
+        print(f"Ошибка при проверке {url}: {e}")
+        return None
+
+
+def download_file(url, save_path, session):
+    try:
+        response = session.get(url, stream=True, timeout=10)
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print(f"Скачан: {save_path}")
+    except Exception as e:
+        print(f"Ошибка при скачивании {url}: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Скачивание медиафайлов с сайта')
+    parser.add_argument('url', help='URL сайта')
+    parser.add_argument('--output', default='downloaded_media', help='Папка для сохранения')
+    args = parser.parse_args()
+
+
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+
+
+    print(f"Анализируем {args.url}...")
+    media_links = get_media_links(args.url, session)
+
+
+    if not media_links:
+        print("Не найдено медиафайлов.")
+        return
+
+
+    print(f"Найдено {len(media_links)} потенциальных файлов. Проверяем...")
+
+
+    # Собираем информацию о файлах
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        file_infos = list(filter(None, executor.map(lambda url: get_file_info(url, session), media_links)))
+
+
+    if not file_infos:
+        print("Нет подходящих файлов для скачивания.")
+        return
+
+
+    # Анализ доступных форматов и размеров
+    extensions = set(info['extension'] for info in file_infos)
+    sizes = [info['size'] for info in file_infos if info['size'] > 0]
+
+
+    print("\nДоступные форматы:", ', '.join(extensions))
+    print("Минимальный размер файла:", min(sizes) if sizes else 0, "байт")
+    print("Максимальный размер файла:", max(sizes) if sizes else 0, "байт")
+
+
+    # Запрос параметров у пользователя
+    selected_exts = input("Введите форматы для скачивания (через запятую, например '.jpg,.png'): ").strip().lower().split(',')
+    selected_exts = [ext.strip() for ext in selected_exts if ext.strip()]
+    min_size = int(input("Введите минимальный размер файла (в байтах): ") or 0)
+
+
+    # Фильтрация файлов
+    filtered_files = [
+        info for info in file_infos
+        if info['extension'] in selected_exts and info['size'] >= min_size
+    ]
+
+
+    if not filtered_files:
+        print("Нет файлов, соответствующих критериям.")
+        return
+
+
+    print(f"\nНайдено {len(filtered_files)} файлов для скачивания.")
+
+
+    # Скачивание с сохранением структуры
+    for info in filtered_files:
+        url = info['url']
+        parsed_url = urlparse(url)
+        path_parts = parsed_url.path.strip('/').split('/')
+
+
+        # Создаем путь, повторяющий структуру сайта
+        save_dir = os.path.join(args.output, parsed_url.netloc, *path_parts[:-1])
+        os.makedirs(save_dir, exist_ok=True)
+
+
+        file_name = os.path.basename(parsed_url.path) or f"file_{hash(url)}"
+        save_path = os.path.join(save_dir, file_name)
+
+
+        download_file(url, save_path, session)
+
+
+    print("\nГотово! Файлы сохранены в:", os.path.abspath(args.output))
+
+
+if __name__ == '__main__':
+    main()
